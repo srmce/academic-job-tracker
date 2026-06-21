@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postings Sync</title>
+<!--
+  Grist custom widget: pulls the shared job-postings feed into THIS doc's local Postings mirror.
+  v1 (2026-05-29): direct anonymous fetch of the PUBLIC source doc, no bridge. Poll-on-open +
+  manual Refresh + 429 backoff (load = daily opens, fine on the getgrist free tier at modest scale).
+  To scale later, point SOURCE_DOC_ID/SOURCE_URL at a CDN static feed instead; logic is unchanged.
+
+  KEY MODEL: rows are matched by the SOURCE row's own Grist id (record.id), stored in the mirror's
+  `SourceId` column. Grist never reuses row ids, so this is a stable key with no generated UID and no
+  trigger formula. Caveat: if the source table is ever bulk-deleted-and-recreated, ids change and
+  every copy's SourceId links break — don't do that; edit rows in place.
+
+  THREE REQUIREMENTS:
+   1. SOURCE doc shared PUBLIC (anyone-with-link viewer) so anonymous reads work (Grist CORS = ACAO:*;
+      authed cross-origin is blocked, anonymous is fine).
+   2. THIS doc has a `Postings` table with the feed columns + a `SourceId` (Int) column. (Template ships it.)
+   3. Widget Access level = "Full document access" (needed to write the mirror).
+
+  Host this file anywhere static and paste its URL into a Grist Custom widget. The plugin-api script
+  below is getgrist.com's; change it if the user doc lives on a self-hosted Grist.
+-->
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<style>
+  body { font: 13px/1.45 system-ui, sans-serif; margin: 10px; color: #222; }
+  #refresh { font: inherit; padding: 5px 12px; cursor: pointer; border: 1px solid #1f3e67;
+             background: #1f3e67; color: #fff; border-radius: 5px; }
+  #refresh:disabled { opacity: .5; cursor: default; }
+  #status { margin-left: 10px; font-weight: 600; }
+  #detail { margin-top: 8px; color: #666; }
+  .err { color: #b00020; }
+</style>
+</head>
+<body>
+  <button id="refresh">Refresh postings</button>
+  <span id="status">Starting…</span>
+  <div id="detail"></div>
+
+<script>
+// ===================== CONFIG =====================
+const SOURCE_DOC_ID = "cJNfNmdJjkwUQhrY1HoNyT"; // the shared PUBLIC source doc
+const SOURCE_TABLE  = "Postings";   // table id in the source doc
+const MIRROR_TABLE  = "Postings";   // table id in THIS (the user's) doc
+const KEY_COL       = "SourceId";   // mirror column (Int) holding the source row's id
+// Real DATA columns to copy. Must EXCLUDE formula columns (FlagsShort, RequirementsShort) — they're
+// computed and recompute in the template on their own; writing to a formula column errors.
+const FIELDS        = ["Institution","Title","Location","Area","Link","Deadline","Requirements","Letters",
+                       "SpecialInstructions","TenureTrack","Postdoc","Teaching","Load","Flags","Ghost",
+                       "Timeline","Source","Contact","Other","DateAdded"];
+const API_BASE      = "https://docs.getgrist.com/api";
+// ==================================================
+
+const $ = (id) => document.getElementById(id);
+const setStatus = (m, err=false) => { const s=$("status"); s.textContent=m; s.className = err?"err":""; };
+const setDetail = (m) => { $("detail").textContent = m; };
+
+// Fetch JSON with exponential backoff + jitter on 429 (rate limit) and 5xx.
+async function fetchWithBackoff(url, tries = 4) {
+  let delay = 800;
+  for (let i = 0; i < tries; i++) {
+    let res;
+    try { res = await fetch(url, { headers: { "Accept": "application/json" } }); }
+    catch (e) { if (i === tries - 1) throw e; }            // network blip: retry
+    if (res && res.ok) return res.json();
+    if (res && res.status !== 429 && res.status < 500)
+      throw new Error(`Source fetch failed: HTTP ${res.status}`); // hard error, don't retry
+    if (i === tries - 1) break;
+    const wait = delay + Math.random() * 300;
+    setStatus(`Rate limited, retrying in ${(wait/1000).toFixed(1)}s…`);
+    await new Promise(r => setTimeout(r, wait));
+    delay *= 2;
+  }
+  throw new Error("Source busy (rate limited). Hit Refresh again in a moment.");
+}
+
+// fetchTable columnar result -> Map of SourceId -> existing mirror rowId.
+function existingByKey(cols) {
+  const ids = cols.id || [];
+  const keys = cols[KEY_COL] || [];   // undefined if mirror lacks SourceId -> everything treated as new
+  const map = new Map();
+  for (let i = 0; i < ids.length; i++) map.set(String(keys[i]), ids[i]);
+  return map;
+}
+
+// Row-wise records -> columnar {colId:[...]}. ChoiceList arrives as ['L',...] and passes straight
+// through; Dates arrive as plain timestamps. Keep mirror column types matching the source.
+function columnar(records, fieldList, extra) {
+  const out = {};
+  for (const f of fieldList) out[f] = records.map(r => r.fields[f]);
+  if (extra) for (const k in extra) out[k] = records.map(extra[k]);
+  return out;
+}
+
+async function sync() {
+  $("refresh").disabled = true;
+  try {
+    setStatus("Fetching postings…"); setDetail("");
+    const src = await fetchWithBackoff(`${API_BASE}/docs/${SOURCE_DOC_ID}/tables/${SOURCE_TABLE}/records`);
+    const recs = src.records || [];
+    if (!recs.length) { setStatus("Source returned no rows."); return; }
+
+    const fieldList = (FIELDS && FIELDS.length) ? FIELDS : Object.keys(recs[0].fields);
+    const existing = existingByKey(await grist.docApi.fetchTable(MIRROR_TABLE));
+
+    const adds = [], updIds = [], updRecs = [];
+    for (const r of recs) {
+      const k = String(r.id);                       // key = source row id
+      if (existing.has(k)) { updIds.push(existing.get(k)); updRecs.push(r); }
+      else adds.push(r);
+    }
+
+    const actions = [];
+    if (updIds.length)                              // refresh feed columns only; leave SourceId + tracking
+      actions.push(["BulkUpdateRecord", MIRROR_TABLE, updIds, columnar(updRecs, fieldList)]);
+    if (adds.length)                               // new rows carry their SourceId; tracking starts empty
+      actions.push(["BulkAddRecord", MIRROR_TABLE, adds.map(() => null),
+                    columnar(adds, fieldList, { [KEY_COL]: r => r.id })]);
+    if (actions.length) await grist.docApi.applyUserActions(actions);
+
+    setStatus(`Synced ${recs.length} postings · ${adds.length} new, ${updIds.length} updated`);
+    setDetail(`Last refreshed ${new Date().toLocaleString()}. `
+            + `Your tracking columns are untouched. Non-destructive: rows removed upstream stay put.`);
+  } catch (e) {
+    setStatus("Couldn't sync.", true);
+    setDetail((e && e.message ? e.message : String(e)) + "  Hit Refresh to retry.");
+  } finally {
+    $("refresh").disabled = false;
+  }
+}
+
+grist.ready({ requiredAccess: "full" });   // 'full' is required to write the mirror table
+$("refresh").addEventListener("click", sync);
+sync();                                     // auto-sync once on open
+</script>
+</body>
+</html>
